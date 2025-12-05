@@ -22,24 +22,37 @@ async function fetchJsonWithTimeout(url: string, ms = 8000) {
     const r = await fetch(url, { cache: "no-store", signal: controller.signal });
 
     const contentType = r.headers.get("content-type") || "";
+
     if (!r.ok) {
       const preview = await r.text().catch(() => "");
-      return { ok: false as const, status: r.status, contentType, preview: preview.slice(0, 200) };
+      return {
+        ok: false as const,
+        tsdbStatus: r.status,
+        contentType,
+        preview: preview.slice(0, 200),
+      };
     }
 
     if (!contentType.includes("application/json")) {
       const preview = await r.text().catch(() => "");
-      return { ok: false as const, status: r.status, contentType, preview: preview.slice(0, 200) };
+      return {
+        ok: false as const,
+        tsdbStatus: r.status,
+        contentType,
+        preview: preview.slice(0, 200),
+      };
     }
 
     const data = await r.json();
     return { ok: true as const, data };
   } catch (e: any) {
-    const msg =
-      e?.name === "AbortError"
-        ? `timeout after ${ms}ms`
-        : e?.message || "fetch failed";
-    return { ok: false as const, status: 0, contentType: "", preview: msg };
+    const msg = e?.name === "AbortError" ? `timeout after ${ms}ms` : e?.message || "fetch failed";
+    return {
+      ok: false as const,
+      tsdbStatus: 0,
+      contentType: "",
+      preview: msg,
+    };
   } finally {
     clearTimeout(t);
   }
@@ -50,8 +63,6 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
-  const startedAt = Date.now();
-
   try {
     const body = (await req.json().catch(() => ({}))) as Body;
     const onlySoccer = body.onlySoccer ?? true;
@@ -62,7 +73,7 @@ export async function POST(req: Request) {
     const sportsKey = process.env.THESPORTSDB_API_KEY;
 
     if (!supabaseUrl) return json({ ok: false, message: "Missing NEXT_PUBLIC_SUPABASE_URL" }, 500);
-    if (!serviceKey) return json({ ok: false, message: "Missing SUPABASE_SERVICE_ROLE_KEY in .env.local (restart dev server)" }, 500);
+    if (!serviceKey) return json({ ok: false, message: "Missing SUPABASE_SERVICE_ROLE_KEY" }, 500);
     if (!sportsKey) return json({ ok: false, message: "Missing THESPORTSDB_API_KEY" }, 500);
 
     const admin = createClient(supabaseUrl, serviceKey, {
@@ -79,7 +90,7 @@ export async function POST(req: Request) {
     if (onlySoccer) q = q.eq("sport", "soccer");
 
     const { data: leagues, error } = await q;
-    if (error) return json({ ok: false, message: "Supabase select failed", error }, 500);
+    if (error) return json({ ok: false, message: "Supabase select failed", error: error.message }, 500);
 
     const processed = leagues?.length ?? 0;
     if (!processed) {
@@ -90,7 +101,7 @@ export async function POST(req: Request) {
         skipped: 0,
         notFound: 0,
         tsdbFailures: 0,
-        tookMs: Date.now() - startedAt,
+        sample: [],
         message: "No leagues found with thesportsdb_league_id = null (nothing to enrich).",
       });
     }
@@ -102,16 +113,17 @@ export async function POST(req: Request) {
 
     const sample: any[] = [];
 
-    // 2) por cada liga: buscar id en TheSportsDB y guardar
     for (const l of leagues ?? []) {
       const name = String(l.name ?? "").trim();
       if (!name) {
         skipped++;
-        if (sample.length < 25) sample.push({ leagueRowId: l.id, status: "skipped_empty_name" });
+        if (sample.length < 25) sample.push({ leagueRowId: l.id, name, result: "skipped_empty_name" });
         continue;
       }
 
-      const url = `https://www.thesportsdb.com/api/v1/json/${sportsKey}/search_all_leagues.php?l=${encodeURIComponent(name)}`;
+      const url = `https://www.thesportsdb.com/api/v1/json/${sportsKey}/search_all_leagues.php?l=${encodeURIComponent(
+        name
+      )}`;
 
       const resp = await fetchJsonWithTimeout(url, 8000);
 
@@ -121,8 +133,8 @@ export async function POST(req: Request) {
           sample.push({
             leagueRowId: l.id,
             name,
-            status: "tsdb_failed",
-            tsdbStatus: resp.status,
+            result: "tsdb_failed",
+            tsdbStatus: resp.tsdbStatus,
             contentType: resp.contentType,
             preview: resp.preview,
           });
@@ -130,16 +142,15 @@ export async function POST(req: Request) {
         continue;
       }
 
-      const jsonResp: any = resp.data;
-
-      // TheSportsDB a veces devuelve la lista en "countries"
-      const candidates: any[] = Array.isArray(jsonResp?.countries) ? jsonResp.countries : [];
+      // TheSportsDB devuelve candidates en "countries" para este endpoint
+      const candidates: any[] = Array.isArray(resp.data?.countries) ? resp.data.countries : [];
       if (!candidates.length) {
         notFound++;
-        if (sample.length < 25) sample.push({ leagueRowId: l.id, name, status: "not_found" });
+        if (sample.length < 25) sample.push({ leagueRowId: l.id, name, result: "not_found" });
         continue;
       }
 
+      // intenta escoger el mejor candidato por country/sport si existen
       const country = String(l.country ?? "").trim().toLowerCase();
       const sport = String(l.sport ?? "").trim().toLowerCase();
 
@@ -155,22 +166,19 @@ export async function POST(req: Request) {
       const tsdbId = best?.idLeague ? String(best.idLeague) : "";
       if (!tsdbId) {
         notFound++;
-        if (sample.length < 25) sample.push({ leagueRowId: l.id, name, status: "not_found_no_idLeague" });
+        if (sample.length < 25) sample.push({ leagueRowId: l.id, name, result: "not_found_no_idLeague" });
         continue;
       }
 
-      const up = await admin
-        .from("leagues")
-        .update({ thesportsdb_league_id: tsdbId })
-        .eq("id", l.id);
+      const up = await admin.from("leagues").update({ thesportsdb_league_id: tsdbId }).eq("id", l.id);
 
       if (up.error) {
-        if (sample.length < 25) sample.push({ leagueRowId: l.id, name, status: "update_failed", error: up.error });
+        if (sample.length < 25) sample.push({ leagueRowId: l.id, name, result: "update_failed", error: up.error.message });
         continue;
       }
 
       updated++;
-      if (sample.length < 25) sample.push({ leagueRowId: l.id, name, status: "updated", thesportsdb_league_id: tsdbId });
+      if (sample.length < 25) sample.push({ leagueRowId: l.id, name, result: "updated", thesportsdb_league_id: tsdbId });
     }
 
     return json({
@@ -180,11 +188,10 @@ export async function POST(req: Request) {
       skipped,
       notFound,
       tsdbFailures,
-      tookMs: Date.now() - startedAt,
+      tip: "Run again to process more: POST with { onlySoccer:true, limit:200 }",
       sample,
     });
   } catch (e: any) {
     return json({ ok: false, message: e?.message ?? "Unknown error" }, 500);
   }
 }
-
