@@ -81,6 +81,7 @@ function guessCategory(name: string) {
 async function fetchJsonWithTimeout(url: string, ms = 8000) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), ms);
+
   try {
     const r = await fetch(url, { cache: "no-store", signal: controller.signal });
     const ct = r.headers.get("content-type") || "";
@@ -89,6 +90,7 @@ async function fetchJsonWithTimeout(url: string, ms = 8000) {
       const preview = await r.text().catch(() => "");
       return { ok: false as const, status: r.status, ct, preview: preview.slice(0, 200) };
     }
+
     if (!ct.includes("application/json")) {
       const preview = await r.text().catch(() => "");
       return { ok: false as const, status: r.status, ct, preview: preview.slice(0, 200) };
@@ -97,7 +99,8 @@ async function fetchJsonWithTimeout(url: string, ms = 8000) {
     const data = await r.json();
     return { ok: true as const, data };
   } catch (e: any) {
-    const msg = e?.name === "AbortError" ? `timeout after ${ms}ms` : e?.message || "fetch failed";
+    const msg =
+      e?.name === "AbortError" ? `timeout after ${ms}ms` : e?.message || "fetch failed";
     return { ok: false as const, status: 0, ct: "", preview: msg };
   } finally {
     clearTimeout(t);
@@ -116,7 +119,8 @@ export async function GET(req: Request) {
   const sportsKey = process.env.THESPORTSDB_API_KEY;
 
   if (!supabaseUrl) return json({ ok: false, message: "Missing NEXT_PUBLIC_SUPABASE_URL" }, 500);
-  if (!serviceKey) return json({ ok: false, message: "Missing SUPABASE_SERVICE_ROLE_KEY (restart dev server)" }, 500);
+  if (!serviceKey)
+    return json({ ok: false, message: "Missing SUPABASE_SERVICE_ROLE_KEY (restart dev server)" }, 500);
   if (!sportsKey) return json({ ok: false, message: "Missing THESPORTSDB_API_KEY" }, 500);
 
   const admin = createClient(supabaseUrl, serviceKey, { auth: { persistSession: false } });
@@ -135,7 +139,7 @@ export async function GET(req: Request) {
   const { data: rows, error } = await q;
   if (error) return json({ ok: false, message: "Supabase select failed", error: error.message }, 500);
 
-  let scanned = rows?.length ?? 0;
+  const scanned = rows?.length ?? 0;
   let updated = 0;
   let skipped = 0;
   let tsdbFailures = 0;
@@ -154,7 +158,17 @@ export async function GET(req: Request) {
 
     if (!resp.ok) {
       tsdbFailures++;
-      if (sample.length < 20) sample.push({ id: r.id, name: r.name, status: "tsdb_failed", ...resp });
+      // ✅ FIX: no duplicar "status" (antes fallaba en Vercel build)
+      if (sample.length < 20) {
+        sample.push({
+          id: r.id,
+          name: r.name,
+          status: "tsdb_failed",
+          tsdbStatus: resp.status,
+          contentType: resp.ct,
+          preview: resp.preview,
+        });
+      }
       continue;
     }
 
@@ -164,11 +178,13 @@ export async function GET(req: Request) {
     const newCountry =
       apiCountry && apiCountry.toLowerCase() !== "n/a"
         ? apiCountry
-        : (r.country && r.country !== "N/A" ? r.country : null);
+        : r.country && r.country !== "N/A"
+          ? r.country
+          : null;
 
     const newCategory = guessCategory(String(r.name ?? ""));
     const newCountrySlug =
-      newCategory === "international" ? "international" : (newCountry ? slugifyCountry(newCountry) : null);
+      newCategory === "international" ? "international" : newCountry ? slugifyCountry(newCountry) : null;
 
     const patch: any = {};
     if (newCountry && newCountry !== r.country) patch.country = newCountry;
@@ -182,7 +198,13 @@ export async function GET(req: Request) {
 
     const up = await admin.from("leagues").update(patch).eq("id", r.id);
     if (up.error) {
-      if (sample.length < 20) sample.push({ id: r.id, name: r.name, status: "update_failed", error: up.error.message });
+      if (sample.length < 20)
+        sample.push({
+          id: r.id,
+          name: r.name,
+          status: "update_failed",
+          error: up.error.message,
+        });
       continue;
     }
 
@@ -200,4 +222,5 @@ export async function GET(req: Request) {
     sample,
   });
 }
+
 
